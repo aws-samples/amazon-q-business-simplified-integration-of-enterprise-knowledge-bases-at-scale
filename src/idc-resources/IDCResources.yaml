@@ -1,0 +1,207 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Template to create IAM Identity Center instance and users'
+
+Parameters:
+  UserName:
+    Type: String
+    Description: Username for the additional IAM Identity Center user
+
+  UserEmail:
+    Type: String
+    Description: Email for the additional IAM Identity Center user
+
+  UserFirstName:
+    Type: String
+    Description: First name of the additional IAM Identity Center user
+
+  UserLastName:
+    Type: String
+    Description: Last name of the additional IAM Identity Center user
+
+Resources:  
+  Instance:
+    Type: AWS::SSO::Instance
+
+  IDCLambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: SSOAdminPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - identitystore:CreateGroup
+                  - identitystore:CreateGroupMembership
+                  - identitystore:CreateUser
+                  - identitystore:ListUsers
+                  - identitystore:ListGroups
+                Resource: 
+                  - !GetAtt Instance.InstanceArn
+                  - !Sub arn:aws:identitystore::${AWS::AccountId}:identitystore/*
+                  - arn:aws:identitystore:::*
+
+  IDCLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.handler
+      Runtime: python3.10
+      Timeout: 300
+      Description: Create IDC Local Instance
+      Role: !GetAtt IDCLambdaExecutionRole.Arn
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import cfnresponse
+
+          id_store_client = boto3.client('identitystore')
+          GROUPS = ["AllUsers"]
+          USERS = [
+              {
+                  "user_name": "application_user",
+                  "email": "application_user@example.com",
+                  "display_name": "Application User",
+                  "given_name": "Application",
+                  "last_name": "User",
+                  "groups": ["AllUsers"]  
+              }
+          ]
+
+          def handler(event, context):
+              try:
+                  print('Received event: ' + json.dumps(event, indent=4, default=str))
+                  if event['RequestType'] in ['Create', 'Update']:
+                      identity_store_id = event['ResourceProperties']['IdentityStoreId']
+                      
+                      # Add the new user to the USERS list
+                      new_user = {
+                          "user_name": event['ResourceProperties']['UserName'],
+                          "email": event['ResourceProperties']['UserEmail'],
+                          "display_name": f"{event['ResourceProperties']['UserFirstName']} {event['ResourceProperties']['UserLastName']}",
+                          "given_name": event['ResourceProperties']['UserFirstName'],
+                          "last_name": event['ResourceProperties']['UserLastName'],
+                          "groups": ["AllUsers"]
+                      }
+                      USERS.append(new_user)
+
+                      group_idx = {}
+                      user_id = []
+                      group_id = []
+                      for group in GROUPS:
+                          if not check_group_exists(identity_store_id, group):
+                              resp = id_store_client.create_group(
+                                  IdentityStoreId=identity_store_id,
+                                  DisplayName=group,
+                                  Description=group
+                              )
+                              print("Group Creation:" + json.dumps(resp, indent=4, default=str))
+                              group_idx[group] = resp["GroupId"]
+                              group_id.append(resp["GroupId"])
+                      for user in USERS:
+                          user_exists = check_user_exists(identity_store_id, user["user_name"])
+                          if not user_exists:
+                              user_resp = id_store_client.create_user(
+                                  IdentityStoreId=identity_store_id,
+                                  UserName=user["user_name"],
+                                  DisplayName=user["display_name"],
+                                  Emails=[{"Value": user["email"], "Type": "Work", "Primary": True}],
+                                  Name={"GivenName": user["given_name"], "FamilyName": user["last_name"]}
+                              )
+                              print("User Creation:" + json.dumps(user_resp, indent=4, default=str))
+                              user_id.append(user_resp["UserId"])
+                              # Assign groups
+                              for grp in user["groups"]:
+                                  if grp in group_idx:
+                                      member_resp = id_store_client.create_group_membership(
+                                          IdentityStoreId=identity_store_id,
+                                          GroupId=group_idx[grp],
+                                          MemberId={"UserId": user_resp["UserId"]}
+                                      )
+                                      print("Group Member Creation:" + json.dumps(member_resp, indent=4, default=str))
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, 
+                                       {'UserID': user_id, 'GroupID': group_id, 
+                                        'UserName': new_user['user_name'], 
+                                        'UserEmail': new_user['email'], 
+                                        'UserFirstName': new_user['given_name'], 
+                                        'UserLastName': new_user['last_name']}, 
+                                       identity_store_id)
+                  else:
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                  print("done")
+              except Exception as e:
+                  print(e)
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {})
+
+          def check_user_exists(identity_store_id, user_id):
+              try:
+                  response = id_store_client.list_users(
+                      IdentityStoreId=identity_store_id,
+                      Filters=[
+                          {
+                              'AttributePath': 'UserName',
+                              'AttributeValue': user_id
+                          }
+                      ]
+                  )
+                  return len(response['Users']) > 0
+              except Exception as e:
+                  print(f"Error checking user existence: {str(e)}")
+                  return False
+
+          def check_group_exists(identity_store_id, group_name):
+              try:
+                  response = id_store_client.list_groups(
+                      IdentityStoreId=identity_store_id,
+                      Filters=[
+                          {
+                              'AttributePath': 'DisplayName',
+                              'AttributeValue': group_name
+                          }
+                      ]
+                  )
+                  return len(response['Groups']) > 0
+              except Exception as e:
+                  print(f"Error checking group existence: {str(e)}")
+                  return False
+
+  IDCInstance:
+    Type: AWS::CloudFormation::CustomResource
+    Properties:
+      ServiceToken: !GetAtt IDCLambda.Arn
+      IdentityStoreId: !GetAtt Instance.IdentityStoreId
+      UserName: !Ref UserName
+      UserEmail: !Ref UserEmail
+      UserFirstName: !Ref UserFirstName
+      UserLastName: !Ref UserLastName
+
+Outputs:
+  IDCInstanceArn:
+    Description: AWS IAM Identity Center instance Arn
+    Value: !GetAtt Instance.InstanceArn
+    Export:
+      Name: !Sub "${AWS::StackName}-IDCInstanceArn"
+
+  IDCUsers:
+    Description: Identity Center Users
+    Value: !Join [",", !GetAtt IDCInstance.UserID]
+    Export:
+      Name: !Sub "${AWS::StackName}-IDCUsers"
+
+  IDCGroups:
+    Description: Identity Center Groups
+    Value: !Join [",", !GetAtt IDCInstance.GroupID]
+    Export:
+      Name: !Sub "${AWS::StackName}-IDCGroups"

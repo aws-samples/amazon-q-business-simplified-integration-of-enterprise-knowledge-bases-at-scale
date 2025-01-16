@@ -1,0 +1,540 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Template to create Q application'
+
+Parameters:
+  S3Bucket:
+    Type: String
+    Description: The name of the S3 bucket to connect to Q Business Application.
+  IDCResourceStackName:
+    Type: String
+    Description: The name of the stack containing IDC (Identity Center) resources
+
+Resources:
+  QBusinessApplication:
+    Type: AWS::QBusiness::Application
+    Properties:
+      DisplayName: workshop-app-01
+      Description: qbusiness demo app
+      IdentityCenterInstanceArn:
+        Fn::ImportValue:
+          Fn::Sub: "${IDCResourceStackName}-IDCInstanceArn"
+
+  DataSourceRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Sid: ''
+            Effect: Allow
+            Principal:
+              Service: 
+                - qbusiness.amazonaws.com
+            Action: 'sts:AssumeRole'
+            Condition:
+              StringEquals:
+                "aws:SourceAccount": !Ref AWS::AccountId
+              ArnLike:
+                "aws:SourceArn": !Sub "arn:aws:qbusiness:${AWS::Region}:${AWS::AccountId}:application/*"
+      Policies:
+        - PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 's3:GetObject'
+                Resource: !Sub                
+                  - 'arn:aws:s3:::${bucket}/*'
+                  - bucket: !Ref S3Bucket
+              - Effect: Allow
+                Action:
+                  - 's3:ListBucket'
+                Resource: !Sub                
+                  - 'arn:aws:s3:::${bucket}'
+                  - bucket: !Ref S3Bucket
+              - Effect: Allow
+                Action:
+                  - 'qbusiness:BatchPutDocument'
+                  - 'qbusiness:BatchDeleteDocument'
+                  - 'qbusiness:PutGroup'
+                  - 'qbusiness:CreateUser'
+                  - 'qbusiness:DeleteGroup'
+                  - 'qbusiness:UpdateUser'
+                  - 'qbusiness:ListGroups'
+                Resource: 
+                  - !Sub "arn:aws:qbusiness:${AWS::Region}:${AWS::AccountId}:application/*"
+                  - !Sub "arn:aws:qbusiness:${AWS::Region}:${AWS::AccountId}:application/*/index/*"
+                  - !Sub "arn:aws:qbusiness:${AWS::Region}:${AWS::AccountId}:application/*/index/*/data-source/*"
+          PolicyName: DataSourcePolicy
+
+  WebExperienceRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Sid: ''
+            Effect: Allow
+            Principal:
+              Service: application.qbusiness.amazonaws.com
+            Action: 
+              - 'sts:AssumeRole'
+              - 'sts:SetContext'
+            Condition:
+              StringEquals:
+                "aws:SourceAccount": !Ref AWS::AccountId
+              ArnLike:
+                "aws:SourceArn": !Sub "arn:aws:qbusiness:${AWS::Region}:${AWS::AccountId}:application/*"
+      Policies:
+        - PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'qbusiness:Chat'
+                  - 'qbusiness:ChatSync'
+                  - 'qbusiness:ListMessages'
+                  - 'qbusiness:ListConversations'
+                  - 'qbusiness:DeleteConversation'
+                  - 'qbusiness:PutFeedback'
+                  - 'qbusiness:GetWebExperience'
+                  - 'qbusiness:GetApplication'
+                  - 'qbusiness:ListPlugins'
+                  - 'qbusiness:GetChatControlsConfiguration'
+                Resource: 
+                  - !Sub "arn:aws:qbusiness:${AWS::Region}:${AWS::AccountId}:application/*"
+              - Effect: Allow
+                Action:
+                  - 'qapps:CreateQApp'
+                  - 'qapps:PredictProblemStatementFromConversation'
+                  - 'qapps:PredictQAppFromProblemStatement'
+                  - 'qapps:CopyQApp'
+                  - 'qapps:GetQApp'
+                  - 'qapps:ListQApps'
+                  - 'qapps:UpdateQApp'
+                  - 'qapps:DeleteQApp'
+                  - 'qapps:AssociateQAppWithUser'
+                  - 'qapps:DisassociateQAppFromUser'
+                  - 'qapps:ImportDocumentToQApp'
+                  - 'qapps:ImportDocumentToQAppSession'
+                  - 'qapps:CreateLibraryItem'
+                  - 'qapps:GetLibraryItem'
+                  - 'qapps:UpdateLibraryItem'
+                  - 'qapps:CreateLibraryItemReview'
+                  - 'qapps:ListLibraryItems'
+                  - 'qapps:CreateSubscriptionToken'
+                  - 'qapps:StartQAppSession'
+                  - 'qapps:StopQAppSession'
+                Resource: 
+                  - !Sub "arn:aws:qbusiness:${AWS::Region}:${AWS::AccountId}:application/*"
+          PolicyName: WebExperiencePolicy
+  QBusinessIndex:
+    Type: AWS::QBusiness::Index
+    Properties:
+      ApplicationId: !GetAtt  QBusinessApplication.ApplicationId
+      DisplayName: sample-index
+      DocumentAttributeConfigurations:
+        - Name: 'startTime'
+          Search: DISABLED
+          Type: DATE
+        - Name: 'lastUpdatedTime'
+          Search: DISABLED
+          Type: DATE
+        - Name: 'endTime'
+          Search: DISABLED
+          Type: DATE
+        - Name: 's3_document_id'
+          Search: ENABLED
+          Type: STRING
+        - Name: 'services'
+          Search: ENABLED
+          Type: STRING_LIST
+
+  QBusinessRetriever:
+    Type: AWS::QBusiness::Retriever
+    Properties:
+      ApplicationId: !GetAtt  QBusinessApplication.ApplicationId
+      Configuration:
+        NativeIndexConfiguration:
+          IndexId: !GetAtt QBusinessIndex.IndexId
+      DisplayName: sample-insights-index
+      Type: NATIVE_INDEX
+
+  QBusinessWebExperience:
+    Type: AWS::QBusiness::WebExperience
+    Properties:
+      ApplicationId: !GetAtt  QBusinessApplication.ApplicationId
+      RoleArn: !GetAtt WebExperienceRole.Arn
+      Title: Q Support Insights 
+
+  QBusinessDataSource:
+    Type: AWS::QBusiness::DataSource
+    Properties:
+      ApplicationId: !GetAtt QBusinessApplication.ApplicationId
+      Configuration:
+        type: "S3"
+        version: "1.0.0"
+        syncMode: FULL_CRAWL
+        additionalProperties:
+          inclusionPrefixes:
+            - ""
+        connectionConfiguration:
+          repositoryEndpointMetadata:
+            BucketName: !Ref S3Bucket
+        repositoryConfigurations:
+          document:
+            fieldMappings:
+              - dataSourceFieldName: "s3_document_id"
+                indexFieldName: "s3_document_id"
+                indexFieldType: "STRING"
+              - dataSourceFieldName: "services"
+                indexFieldName: "services"
+                indexFieldType: "STRING_LIST"
+      DisplayName: qci-insights-datasource
+      SyncSchedule: 'cron(0 0 * * ? *)'
+      IndexId: !GetAtt QBusinessIndex.IndexId
+      RoleArn: !GetAtt DataSourceRole.Arn
+
+  AddUserGroupLambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: SSOAdminPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sso:CreateApplicationAssignment
+                  - sso:ListApplicationAssignments
+                  - sso:ListApplications
+                Resource:
+                  - !Sub arn:aws:sso::${AWS::AccountId}:application/*
+                  - Fn::ImportValue: !Sub "${IDCResourceStackName}-IDCInstanceArn"
+
+  AddUserGroupLambda:
+    Type: AWS::Lambda::Function
+    DependsOn:
+      - QBusinessApplication
+    Properties:
+      Handler: index.handler
+      Runtime: python3.10
+      Timeout: 300
+      Description: Add IDC user to Q Business Application
+      Role: !GetAtt AddUserGroupLambdaExecutionRole.Arn
+      Code:
+        ZipFile: |
+          import json
+          import time
+          import cfnresponse
+          import boto3
+
+          sso_client = boto3.client('sso-admin')
+
+          def handler(event, context):
+              try:
+                  print('Received event: ' + json.dumps(event, indent=4, default=str))
+                  if event['RequestType'] in ['Create', 'Update']:
+                      time.sleep(5)
+                      instance_arn = event['ResourceProperties']['InstanceArn']
+                      application_res = sso_client.list_applications(InstanceArn=instance_arn)
+                      print("Add or update user/group in Q Business Application")
+                      for app in application_res["Applications"]:
+                          application_arn = app["ApplicationArn"]
+                          print("Application ARN: " + application_arn)
+                          
+                          for user in event['ResourceProperties']['Users']:
+                              if not assignment_exists(application_arn, user, 'USER'):
+                                  create_response_user = sso_client.create_application_assignment(
+                                      ApplicationArn=application_arn,
+                                      PrincipalId=user,
+                                      PrincipalType='USER'
+                                  )
+                                  print("User Association:" + json.dumps(create_response_user, indent=4, default=str))
+                              else:
+                                  print(f"Assignment already exists for user {user}")
+                          
+                          for group in event['ResourceProperties']['Groups']:
+                              if not assignment_exists(application_arn, group, 'GROUP'):
+                                  create_response_group = sso_client.create_application_assignment(
+                                      ApplicationArn=application_arn,
+                                      PrincipalId=group,
+                                      PrincipalType='GROUP'
+                                  )
+                                  print("Group Association:" + json.dumps(create_response_group, indent=4, default=str))
+                              else:
+                                  print(f"Assignment already exists for group {group}")
+                      
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {}, None)
+                  else:
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {}, None)
+                  print("done")
+              except Exception as e:
+                  print(e)
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {}, None)
+
+          def assignment_exists(application_arn, principal_id, principal_type):
+              try:
+                  paginator = sso_client.get_paginator('list_application_assignments')
+                  for page in paginator.paginate(ApplicationArn=application_arn):
+                      for assignment in page['ApplicationAssignments']:
+                          if assignment['PrincipalId'] == principal_id and assignment['PrincipalType'] == principal_type:
+                              return True
+                  return False
+              except Exception as e:
+                  print(f"Error checking assignment existence: {str(e)}")
+                  return False
+
+  AddUserGroup:
+    Type: AWS::CloudFormation::CustomResource
+    DependsOn:
+      - QBusinessApplication
+    Properties:
+      ServiceToken: !GetAtt AddUserGroupLambda.Arn
+      ServiceTimeout: 480
+      Users: 
+        Fn::Split:
+          - ","
+          - Fn::ImportValue: !Sub "${IDCResourceStackName}-IDCUsers"
+      Groups: 
+        Fn::Split:
+          - ","
+          - Fn::ImportValue: !Sub "${IDCResourceStackName}-IDCGroups"
+      InstanceArn: 
+        Fn::ImportValue: !Sub "${IDCResourceStackName}-IDCInstanceArn"
+
+  AddBoostingLambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: QBusinessPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'qbusiness:UpdateRetriever'
+                  - 'qbusiness:GetRetriever'
+                Resource:
+                  - !Sub "arn:aws:qbusiness:${AWS::Region}:${AWS::AccountId}:application/${QBusinessApplication.ApplicationId}"
+                  - !Sub "arn:aws:qbusiness:${AWS::Region}:${AWS::AccountId}:application/${QBusinessApplication.ApplicationId}/retriever/${QBusinessRetriever.RetrieverId}"
+
+  AddBoostingLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.handler
+      Runtime: python3.9
+      Timeout: 300
+      Description: Add Boosting to Q Business Application
+      Role: !GetAtt AddBoostingLambdaExecutionRole.Arn
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import cfnresponse
+
+
+          qbusiness_client = boto3.client('qbusiness')
+
+          def handler(event, context):
+              try:
+
+                  print('Received event: ' + json.dumps(event, indent=4, default=str))
+                  
+                  application_id = event["ResourceProperties"]["ApplicationId"]
+                  retriever_id = event["ResourceProperties"]["RetrieverId"]
+                  display_name = event["ResourceProperties"]["DisplayName"]
+                  boost_override_configuration = json.loads(event["ResourceProperties"]["BoostOverrideConfiguration"])
+                  
+                  if event['RequestType'] in ['Create', 'Update']:
+                      qbusiness_client.update_retriever(
+                          applicationId=application_id,
+                          retrieverId=retriever_id,
+                          displayName=display_name,
+                          configuration=boost_override_configuration
+                      )
+                      response = qbusiness_client.get_retriever(
+                          applicationId=application_id,
+                          retrieverId=retriever_id,
+                      )
+                      print("Attempted to update retriever, response is:"+ json.dumps(response, indent=4, default=str))
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {
+                          "RetrieverId": response["retrieverId"],
+                          "RetrieverArn": response["retrieverArn"],
+                      }, response["retrieverId"])
+                  
+                  elif event["RequestType"] == "Delete":
+                      # Add delete logic here if needed
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {}, event["PhysicalResourceId"])
+                  
+                  else:
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {}, None)
+              except Exception as e:
+                    print(e)
+                    cfnresponse.send(event, context, cfnresponse.FAILED, {}, None)
+              
+  AddBoosting:
+    Type: AWS::CloudFormation::CustomResource
+    Properties:
+      ServiceToken: !GetAtt AddBoostingLambda.Arn
+      ApplicationId: !Ref QBusinessApplication
+      RetrieverId: !GetAtt QBusinessRetriever.RetrieverId
+      DisplayName: MyQBusinessRetriever
+      BoostOverrideConfiguration:
+        Fn::Sub: |
+          {
+            "nativeIndexConfiguration": {
+              "indexId": "${QBusinessIndex.IndexId}",
+              "boostingOverride": {
+                "_document_title": {
+                  "stringConfiguration": {
+                    "boostingLevel": "MEDIUM"
+                  }
+                },
+                "services": {
+                  "stringListConfiguration": {
+                    "boostingLevel": "HIGH"
+                  }
+                },
+                "s3_document_id": {
+                  "stringConfiguration": {
+                    "boostingLevel": "MEDIUM"
+                  }
+                }
+              }
+            }
+          }
+
+  ChatControlsLambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: QBusinessPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'qbusiness:UpdateChatControlsConfiguration'
+                  - 'qbusiness:DeleteChatControlsConfiguration'
+                Resource: 
+                  - !Sub "arn:aws:qbusiness:${AWS::Region}:${AWS::AccountId}:application/${QBusinessApplication.ApplicationId}"
+
+  ChatControlsLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.handler
+      Runtime: python3.9
+      Timeout: 300
+      Description: Manage Q Business Chat Controls
+      Role: !GetAtt ChatControlsLambdaExecutionRole.Arn
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import cfnresponse
+
+          qbusiness_client = boto3.client('qbusiness')
+
+          def handler(event, context):
+              try:
+                  print('Received event: ' + json.dumps(event, indent=4, default=str))
+                  application_id = event["ResourceProperties"]["ApplicationId"]
+                  topic_configurations = event["ResourceProperties"]["TopicConfigurations"]
+
+                  print('Received event: ' + json.dumps(event, indent=4, default=str))
+
+                  if event['RequestType'] in ['Create', 'Update']:
+                      response = qbusiness_client.update_chat_controls_configuration(
+                          applicationId=application_id,
+                          topicConfigurationsToCreateOrUpdate=topic_configurations,
+                      )
+                      print("Attempted to create chat controls topic, response is:" + json.dumps(response, indent=4, default=str))
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {}, None)
+                  
+                  elif event["RequestType"] == "Delete":
+                      response = qbusiness_client.delete_chat_controls_configuration(
+                          applicationId=application_id
+                      )
+                      print("Attempted to delete chat controls topic, response is:"+ json.dumps(response, indent=4, default=str))
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {}, None)
+                  else:
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {}, None)
+              except Exception as e:
+                    print(e)
+                    cfnresponse.send(event, context, cfnresponse.FAILED, {}, None)
+
+  ChatControlsCustomResource:
+    Type: AWS::CloudFormation::CustomResource
+    Properties:
+      ServiceToken: !GetAtt ChatControlsLambda.Arn
+      ApplicationId: !Ref QBusinessApplication
+      TopicConfigurations:
+        - name: topic
+          rules:
+            - ruleType: CONTENT_BLOCKER_RULE
+              ruleConfiguration:
+                contentBlockerRule:
+                  systemMessageOverride: This message is blocked as it contains secure content
+          exampleChatMessages:
+            - arn:*:ec2:us-east-1:123456789012:instance/i-abcdef123
+            - arn:*:ec2:us-west-2:123456789012:vpc/bpc-abcdef123
+            - arn:*:kms:eu-west-1:123456789012:key/12345678-1234-12345678-abc12345678
+            - s3://bucket/prefix/file.csv
+            - arn:*:s3::::bucket-name
+          description: To identity AWS ARNs in Requests and Responses
+        - name: security-topic
+          rules:
+            - ruleType: CONTENT_RETRIEVAL_RULE
+              ruleConfiguration:
+                contentRetrievalRule:
+                  eligibleDataSources: []
+          exampleChatMessages:
+            - confidential incident violating policy vulnerable critical issue not enforced
+            - exposed keys rules without permissions without bypass
+            - exposed accounts security permissions security suspicious
+            - ((?:keys?|publicly)(?=[^.]*(expos(?:es|ure))))|((?:(expos(?:es|ure)))(?=[^.]*keys?|publicly))
+            - ((?:confidential|secret)(?=[^.]*(expos(?:es|ure|ed))))|((?:(expos(?:es|ure|ed)))(?=[^.]*(confidential|secret)
+          description: To answer based on the security resources
+
+Outputs:
+  DataSourceRole:
+    Description: The DataSourceRole Arn
+    Value: !GetAtt DataSourceRole.Arn
+
+  WebExperienceRole:
+    Description: The WebExperienceRole Arn
+    Value: !GetAtt WebExperienceRole.Arn

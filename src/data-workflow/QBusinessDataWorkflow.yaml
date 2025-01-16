@@ -1,0 +1,1190 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: BlogCdkStack
+
+Parameters:
+  ReportingEmail:
+    Type: String
+    Description: "Email address to receive notifications"
+    AllowedPattern: "^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}$"
+    ConstraintDescription: "Must be a valid email address"
+
+Resources:
+  AmazonQDatasetBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - BucketKeyEnabled: true
+            ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: ObjectWriter
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+    UpdateReplacePolicy: Retain
+    DeletionPolicy: Retain
+
+  AmazonQDatasetBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref AmazonQDatasetBucket
+      PolicyDocument:
+        Statement:
+          - Action: s3:*
+            Condition:
+              Bool:
+                aws:SecureTransport: 'false'
+            Effect: Deny
+            Principal:
+              AWS: '*'
+            Resource:
+              - !GetAtt AmazonQDatasetBucket.Arn
+              - !Join 
+                - ''
+                - - !GetAtt AmazonQDatasetBucket.Arn
+                  - /*
+        Version: '2012-10-17'
+
+  InputMapLambdaFunctionServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Action: sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+        Version: '2012-10-17'
+      ManagedPolicyArns:
+        - !Join 
+          - ''
+          - - 'arn:'
+            - !Ref AWS::Partition
+            - :iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+
+  InputMapLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Code:
+        ZipFile: |
+          import json
+          from datetime import datetime, timedelta
+
+          def lambda_handler(event, context):
+              return [
+                  {
+                      "doc_type": "PDF",
+                      "doc_url": "https://docs.aws.amazon.com/sagemaker/latest/dg/sagemaker-dg.pdf",
+                      "aws_service": "SageMaker",
+                      "enable_pii_redaction": False
+                  },
+                  {
+                      "doc_type": "PDF",
+                      "doc_url": "https://docs.aws.amazon.com/pdfs/amazonq/latest/qbusiness-ug/qbusiness-ug.pdf",
+                      "aws_service": "Q Business",
+                      "enable_pii_redaction": False
+                  }
+              ]
+      Description: InputMapLambdaFunction
+      Handler: index.lambda_handler
+      MemorySize: 128
+      Role: !GetAtt InputMapLambdaFunctionServiceRole.Arn
+      Runtime: python3.12
+      Timeout: 10
+
+  IngestionLambdaFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Action: sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+        Version: '2012-10-17'
+      ManagedPolicyArns:
+        - !Join 
+          - ''
+          - - 'arn:'
+            - !Ref AWS::Partition
+            - :iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      RoleName: amazon-q-blog-ingestion-lambda-role
+  DataIngestionLambdaServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Action: sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+        Version: '2012-10-17'
+      ManagedPolicyArns:
+        - !Join 
+          - ''
+          - - 'arn:'
+            - !Ref AWS::Partition
+            - :iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+
+  DataIngestionLambdaServiceRoleDefaultPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyDocument:
+        Statement:
+          - Action:
+              - s3:DeleteObject
+              - s3:GetObject
+              - s3:ListBucket
+              - s3:PutObject
+            Effect: Allow
+            Resource:
+              - !GetAtt AmazonQDatasetBucket.Arn
+              - !Join 
+                - ''
+                - - !GetAtt AmazonQDatasetBucket.Arn
+                  - /*
+            Sid: AllowS3
+        Version: '2012-10-17'
+      PolicyName: DataIngestionLambdaServiceRoleDefaultPolicy
+      Roles: 
+        - !Ref DataIngestionLambdaServiceRole
+
+  DataIngestionLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Code:
+        ZipFile: |
+          import os
+          import json
+          import boto3
+          import logging
+          import urllib3
+          from io import BytesIO
+          from PyPDF2 import PdfReader
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          MAX_CONTENT_LENGTH = 100000  # 10000 * 10
+
+          class DocumentIngester:
+              def __init__(self):
+                  self.s3_client = boto3.client("s3")
+                  self.bucket_name = os.getenv("BUCKET_NAME")
+                  self.unprocessed_prefix = os.getenv("UNPROCESSED_PREFIX")
+                  self.processed_prefix = os.getenv("PROCESSED_PREFIX")
+                  self.http = urllib3.PoolManager()
+
+              def read_pdf(self, url):
+                  try:
+                      response = self.http.request('GET', url)
+                      if response.status != 200:
+                          raise Exception(f"Failed to fetch PDF. Status code: {response.status}")
+                      pdf_content = response.data
+                  except Exception as e:
+                      logger.error(f"Error fetching PDF from {url}: {e}")
+                      raise
+
+                  reader = PdfReader(BytesIO(pdf_content))
+                  title = reader.metadata.get('/Title') or url.split('/')[-1].replace('.pdf', '')
+
+                  document = {
+                      'Url': url,
+                      'Title': title,
+                      'Author': reader.metadata.get('/Author'),
+                      'Creator': reader.metadata.get('/Creator'),
+                      'CreationDate': reader.metadata.get('/CreationDate'),
+                      'LastUpdatedDate': reader.metadata.get('/ModDate'),
+                      'Keywords': reader.metadata.get('/Keywords')
+                  }
+
+                  content = self.extract_content(reader)
+                  document['Content'] = content[:MAX_CONTENT_LENGTH]
+                  return document
+
+              @staticmethod
+              def extract_content(reader):
+                  content = ''
+                  for page in reader.pages:
+                      content += page.extract_text() + '\n'
+                      if len(content) > MAX_CONTENT_LENGTH:
+                          break
+                  return content
+
+              def ingest_document(self, document):
+                  doc_type = document.get("doc_type")
+                  doc_url = document.get("doc_url")
+                  doc_enable_pii_redaction = document.get("enable_pii_redaction")
+
+                  if doc_type == "PDF":
+                      document_data = self.read_pdf(doc_url)
+                      document_data['AWS_Service'] = document.get("aws_service")
+                  else:
+                      raise ValueError(f"Unsupported document type: {doc_type}")
+
+                  unprocessed_key = f"{self.unprocessed_prefix}/{doc_url.split('/')[-1]}.json"
+                  self.upload_to_s3(unprocessed_key, json.dumps(document_data))
+
+                  return {
+                      'StatusCode': 200, 
+                      'unprocessed_key': unprocessed_key,
+                      'enable_pii_redaction': doc_enable_pii_redaction,
+                  }
+
+              def upload_to_s3(self, key, body):
+                  try:
+                      self.s3_client.put_object(
+                          Bucket=self.bucket_name,
+                          Key=key,
+                          Body=body,
+                          ContentType="application/json",
+                      )
+                      logger.info(f"Uploaded file: s3://{self.bucket_name}/{key}")
+                  except Exception as e:
+                      logger.error(f"Error uploading to S3: {e}")
+                      raise
+
+          def lambda_handler(event, context):
+              logger.info(f"Input: {json.dumps(event)}")
+              
+              try:
+                  ingester = DocumentIngester()
+                  return ingester.ingest_document(event.get('value'))
+              except Exception as e:
+                  logger.error(f"An error occurred: {e}")
+                  return {
+                      'StatusCode': 500,
+                      'error': str(e)
+                  }
+      Description: Lambda function for Data Ingestion from custom DataSource to S3
+      Environment:
+        Variables:
+          UNPROCESSED_PREFIX: unprocessed
+          PROCESSED_PREFIX: processed
+          PROCESSED_SUFFIX: .txt
+          BUCKET_NAME: !Ref AmazonQDatasetBucket
+      FunctionName: amazon-q-blog-ingestion-lambda
+      Handler: index.lambda_handler
+      MemorySize: 1024
+      Role: !GetAtt DataIngestionLambdaServiceRole.Arn
+      Runtime: python3.12
+      Timeout: 900
+      TracingConfig:
+        Mode: Active
+      Layers:
+        - !GetAtt PyPDF2Layer.LayerVersionArn
+    DependsOn:
+      - DataIngestionLambdaServiceRoleDefaultPolicy
+
+  DocumentProcessingLambdaServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Action: sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+        Version: '2012-10-17'
+      ManagedPolicyArns:
+        - !Join 
+          - ''
+          - - 'arn:'
+            - !Ref AWS::Partition
+            - :iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+
+  DocumentProcessingLambdaServiceRoleDefaultPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyDocument:
+        Statement:
+          - Action:
+              - s3:DeleteObject
+              - s3:GetObject
+              - s3:ListBucket
+              - s3:PutObject
+            Effect: Allow
+            Resource:
+              - !GetAtt AmazonQDatasetBucket.Arn
+              - !Join 
+                - ''
+                - - !GetAtt AmazonQDatasetBucket.Arn
+                  - /*
+            Sid: AllowS3
+          - Action:
+              - comprehend:ContainsPiiEntities
+              - comprehend:DetectEntities
+              - comprehend:DetectPiiEntities
+            Effect: Allow
+            Resource: '*'
+            Sid: AllowComprehend
+        Version: '2012-10-17'
+      PolicyName: DocumentProcessingLambdaServiceRoleDefaultPolicy
+      Roles: 
+        - !Ref DocumentProcessingLambdaServiceRole
+
+  DocumentProcessingLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Code:
+        ZipFile: |
+          import os
+          import json
+          import boto3
+          import logging
+          from datetime import datetime, timezone
+          from botocore.exceptions import ClientError
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          COMPREHEND_TEXT_LIMIT = 10000-50
+          COMPREHEND_PII_SCORE_THRESHOLD = 0.4
+
+          class DocumentProcessor:
+              def __init__(self):
+                  self.s3_client = boto3.client('s3')
+                  self.redactor = ComprehendRedactor()
+                  self.bucket_name = os.getenv("BUCKET_NAME")
+                  self.processed_prefix = os.getenv("PROCESSED_PREFIX")
+                  self.processed_suffix = os.getenv("PROCESSED_SUFFIX")
+
+              def redact_piis(self, sensitive_text):
+                  redact_pii_types = ["EMAIL", "NAME", "PASSWORD", "AWS_ACCESS_KEY"]
+                  try:
+                      return self.redactor.redact_piis(sensitive_text, redact_pii_types)
+                  except ClientError as e:
+                      logger.error(f"An error occurred during PII redaction: {e}")
+                      return None
+
+              def get_s3_object(self, key):
+                  try:
+                      response = self.s3_client.get_object(Bucket=self.bucket_name, Key=key)
+                      return json.loads(response["Body"].read().decode("utf-8"))
+                  except ClientError as e:
+                      logger.error(f"Error retrieving object from S3: {e}")
+                      raise
+
+              def put_s3_object(self, key, body):
+                  try:
+                      self.s3_client.put_object(Bucket=self.bucket_name, Key=key, Body=body)
+                      logger.info(f"File uploaded: {key}")
+                  except ClientError as e:
+                      logger.error(f"Error uploading object to S3: {e}")
+                      raise
+
+              def delete_s3_object(self, key):
+                  try:
+                      self.s3_client.delete_object(Bucket=self.bucket_name, Key=key)
+                      logger.info(f"Removed file: {key}")
+                  except ClientError as e:
+                      logger.error(f"Error deleting object from S3: {e}")
+                      raise
+
+              def format_date(self, date_string):
+                  if date_string:
+                      dt = datetime.strptime(date_string[2:-1], "%Y%m%d%H%M%S")
+                      return dt.astimezone(timezone.utc).isoformat()
+                  return None
+
+              def process_document(self, doc_data, enable_pii_redaction):
+                  content = doc_data['Content']
+                  if enable_pii_redaction:
+                      content = self.redact_piis(content)
+                      if not content:
+                          raise ValueError("PII redaction failed")
+
+                  document_id = f"{doc_data.get('Url', '').split('/')[-1]}{self.processed_suffix}"
+                  processed_key = f"{self.processed_prefix}/{document_id}"
+
+                  creation_date = self.format_date(doc_data.get('CreationDate'))
+                  last_updated_date = self.format_date(doc_data.get('LastUpdatedDate')) or creation_date
+
+                  metadata = {
+                      "DocumentId": document_id,
+                      "Attributes": {
+                          "_created_at": creation_date,
+                          "_last_updated_at": last_updated_date,
+                          "_source_uri": doc_data.get('Url'),
+                          "author": doc_data.get('Author'),
+                          "services": [doc_data.get('AWS_Service')],
+                      },
+                      "Title": doc_data.get('Title'),
+                      "ContentType": "plain/text",
+                  }
+
+                  self.put_s3_object(processed_key, content.encode("utf-8"))
+                  metadata_key = f"{processed_key}.metadata.json"
+                  self.put_s3_object(metadata_key, json.dumps(metadata, indent=4))
+
+                  return processed_key, metadata_key
+              
+          class ComprehendRedactor:
+              def __init__(self):
+                  self.comprehend = boto3.client('comprehend')
+
+              def redact_piis(self, text, pii_types):
+                  # Split the text if it's too large for single comprehend APIs
+                  text_parts = []
+                  remainder_text = text
+                  split_pattern = "\n"
+                  while len(remainder_text) > COMPREHEND_TEXT_LIMIT:
+                      i = remainder_text[:COMPREHEND_TEXT_LIMIT].rfind(split_pattern)
+                      if i != -1:
+                          i += len(split_pattern)
+                          text_parts.append(remainder_text[:i])
+                          remainder_text = remainder_text[i:]
+                      else:
+                          text_parts.append(remainder_text)
+                  text_parts.append(remainder_text)
+
+                  output_parts = []
+                  for txt in text_parts:
+                      r = self.comprehend.detect_pii_entities(Text=txt, LanguageCode="en")
+                      pii_entities = [
+                          e for e in r.get("Entities", [])
+                          if e.get("Type") in pii_types and e.get("Score") > COMPREHEND_PII_SCORE_THRESHOLD
+                      ]
+
+                      output = list(txt)
+                      for e in pii_entities:
+                          start = e["BeginOffset"]
+                          end = e["EndOffset"]
+                          print(f"Redacting: {output[start:end]}")
+                          output[start:end] = "*" * (end - start)
+                      output_parts.append("".join(output))
+                  return split_pattern.join(output_parts)
+
+
+          def lambda_handler(event, context):
+              logger.info(f"Received event: {event}")
+
+              processor = DocumentProcessor()
+              unprocessed_key = event.get('unprocessed_key')
+              enable_pii_redaction = event.get('enable_pii_redaction')
+
+              try:
+                  doc_data = processor.get_s3_object(unprocessed_key)
+                  processed_key, metadata_key = processor.process_document(doc_data, enable_pii_redaction)
+                  processor.delete_s3_object(unprocessed_key)
+
+                  return {
+                      "statusCode": 200,
+                      "processed_key": processed_key,
+                      "metadata_key": metadata_key
+                  }
+              except ValueError as ve:
+                  return {
+                      "statusCode": 400,
+                      "errorMessage": str(ve),
+                      "processed_key": None,
+                      "metadata_key": None
+                  }
+              except Exception as e:
+                  logger.error(f"An unexpected error occurred: {e}")
+                  return {
+                      "statusCode": 500,
+                      "errorMessage": "An unexpected error occurred",
+                      "processed_key": None,
+                      "metadata_key": None
+                  }
+      Description: Lambda function for Processing raw documents ingested to S3, redact potential PIIs and store to destination location.
+      Environment:
+        Variables:
+          UNPROCESSED_PREFIX: unprocessed
+          PROCESSED_PREFIX: processed
+          PROCESSED_SUFFIX: .txt
+          BUCKET_NAME: !Ref AmazonQDatasetBucket
+      FunctionName: amazon-q-blog-processing-lambda
+      Handler: index.lambda_handler
+      MemorySize: 512
+      Role: !GetAtt DocumentProcessingLambdaServiceRole.Arn
+      Runtime: python3.12
+      Timeout: 60
+      TracingConfig:
+        Mode: Active
+    DependsOn:
+      - DocumentProcessingLambdaServiceRoleDefaultPolicy
+
+  DataWorkflowStateMachineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Action: sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service: states.amazonaws.com
+        Version: '2012-10-17'
+
+  DataWorkflowStateMachineRoleDefaultPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyDocument:
+        Statement:
+          - Action: lambda:InvokeFunction
+            Effect: Allow
+            Resource:
+              - !GetAtt DataIngestionLambda.Arn
+              - !GetAtt DocumentProcessingLambda.Arn
+              - !GetAtt InputMapLambdaFunction.Arn
+              - !Join 
+                - ''
+                - - !GetAtt DataIngestionLambda.Arn
+                  - :*
+              - !Join 
+                - ''
+                - - !GetAtt DocumentProcessingLambda.Arn
+                  - :*
+              - !Join 
+                - ''
+                - - !GetAtt InputMapLambdaFunction.Arn
+                  - :*
+          - Action:
+              - states:DescribeExecution
+              - states:RedriveExecution
+              - states:StartExecution
+              - states:StopExecution
+            Effect: Allow
+            Resource:
+              - !Join 
+                - ''
+                - - 'arn:aws:states:'
+                  - !Ref AWS::Region
+                  - ':'
+                  - !Ref AWS::AccountId
+                  - :stateMachine:amazon-q-blog-state-machine
+              - !Join 
+                - ''
+                - - 'arn:aws:states:'
+                  - !Ref AWS::Region
+                  - ':'
+                  - !Ref AWS::AccountId
+                  - :stateMachine:amazon-q-blog-state-machine:*
+            Sid: AllowStateMachineExecutionActions
+        Version: '2012-10-17'
+      PolicyName: DataWorkflowStateMachineRoleDefaultPolicy
+      Roles:
+        - !Ref DataWorkflowStateMachineRole
+
+  DataWorkflowStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      DefinitionString: !Sub 
+        - |-
+          {
+            "StartAt": "InvokeInputMapLambdaFunction",
+            "States": {
+              "InvokeInputMapLambdaFunction": {
+                "Next": "DistributedMap",
+                "Retry": [
+                  {
+                    "ErrorEquals": [
+                      "Lambda.ClientExecutionTimeoutException",
+                      "Lambda.ServiceException",
+                      "Lambda.AWSLambdaException",
+                      "Lambda.SdkClientException"
+                    ],
+                    "IntervalSeconds": 2,
+                    "MaxAttempts": 6,
+                    "BackoffRate": 2
+                  }
+                ],
+                "Type": "Task",
+                "OutputPath": "$.Payload",
+                "Resource": "arn:${AWS::Partition}:states:::lambda:invoke",
+                "Parameters": {
+                  "FunctionName": "${InputMapLambdaFunctionArn}",
+                  "Payload.$": "$"
+                }
+              },
+              "DistributedMap": {
+                "Type": "Map",
+                "Next": "Data workflow succeeded!",
+                "Parameters": {
+                  "index.$": "$$.Map.Item.Index",
+                  "value.$": "$$.Map.Item.Value"
+                },
+                "ItemsPath": "$",
+                "ItemProcessor": {
+                  "ProcessorConfig": {
+                    "Mode": "INLINE"
+                  },
+                  "StartAt": "InvokeDataIngestionLambda",
+                  "States": {
+                    "InvokeDataIngestionLambda": {
+                      "Next": "InvokeDocumentProcessingLambda",
+                      "Retry": [
+                        {
+                          "ErrorEquals": [
+                            "Lambda.ClientExecutionTimeoutException",
+                            "Lambda.ServiceException",
+                            "Lambda.AWSLambdaException",
+                            "Lambda.SdkClientException"
+                          ],
+                          "IntervalSeconds": 2,
+                          "MaxAttempts": 6,
+                          "BackoffRate": 2
+                        }
+                      ],
+                      "Type": "Task",
+                      "OutputPath": "$.Payload",
+                      "Resource": "arn:${AWS::Partition}:states:::lambda:invoke",
+                      "Parameters": {
+                        "FunctionName": "${DataIngestionLambdaArn}",
+                        "Payload.$": "$"
+                      }
+                    },
+                    "InvokeDocumentProcessingLambda": {
+                      "End": true,
+                      "Retry": [
+                        {
+                          "ErrorEquals": [
+                            "Lambda.ClientExecutionTimeoutException",
+                            "Lambda.ServiceException",
+                            "Lambda.AWSLambdaException",
+                            "Lambda.SdkClientException"
+                          ],
+                          "IntervalSeconds": 2,
+                          "MaxAttempts": 6,
+                          "BackoffRate": 2
+                        }
+                      ],
+                      "Type": "Task",
+                      "OutputPath": "$.Payload",
+                      "Resource": "arn:${AWS::Partition}:states:::lambda:invoke",
+                      "Parameters": {
+                        "FunctionName": "${DocumentProcessingLambdaArn}",
+                        "Payload.$": "$"
+                      }
+                    }
+                  }
+                },
+                "MaxConcurrency": 1
+              },
+              "Data workflow succeeded!": {
+                "Type": "Succeed"
+              }
+            }
+          }
+        - InputMapLambdaFunctionArn: !GetAtt InputMapLambdaFunction.Arn
+          DataIngestionLambdaArn: !GetAtt DataIngestionLambda.Arn
+          DocumentProcessingLambdaArn: !GetAtt DocumentProcessingLambda.Arn
+      RoleArn: !GetAtt DataWorkflowStateMachineRole.Arn
+      StateMachineName: amazon-q-blog-state-machine
+    UpdateReplacePolicy: Delete
+    DeletionPolicy: Delete
+
+  StartStateMachineRule:
+    Type: AWS::Events::Rule
+    Properties:
+      ScheduleExpression: rate(1 day)
+      State: ENABLED
+      Targets:
+        - Arn: !Ref DataWorkflowStateMachine
+          Id: Target0
+          Input: '{"message":"starting state machine"}'
+          RoleArn: !GetAtt EventBridgeRole.Arn
+
+  EventBridgeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Action: sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+        Version: '2012-10-17'
+
+  EventBridgeRoleDefaultPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyDocument:
+        Statement:
+          - Action: states:StartExecution
+            Effect: Allow
+            Resource: !Ref DataWorkflowStateMachine
+        Version: '2012-10-17'
+      PolicyName: EventBridgeRoleDefaultPolicy
+      Roles:
+        - !Ref EventBridgeRole
+
+
+  PyPDF2Layer:
+    Type: Custom::PyPDF2Layer
+    Properties:
+      ServiceToken: !GetAtt PyPDF2LayerFunction.Arn
+      LayerArn: !Ref AWS::NoValue
+      LayerVersion: !Ref AWS::NoValue
+
+  PyPDF2LayerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.lambda_handler
+      Role: !GetAtt PyPDF2LayerFunctionRole.Arn
+      Code:
+        ZipFile: |
+          import cfnresponse
+          import boto3
+          import os
+          import subprocess
+          import shutil
+          import zipfile
+          import io
+
+          LAYER_NAME = "PyPDF2Layer"
+
+          def lambda_handler(event, context):
+              response_data = {}
+              
+              try:
+                  request_type = event['RequestType']
+                  
+                  if request_type == 'Create' or request_type == 'Update':
+                      # Create a temporary directory structure
+                      temp_dir = '/tmp/layer'
+                      python_dir = os.path.join(temp_dir, 'python')
+                      os.makedirs(python_dir, exist_ok=True)
+                      
+                      # Install PyPDF2 and its dependencies
+                      subprocess.check_call([
+                          'pip', 'install', 
+                          'PyPDF2', 
+                          '-t', python_dir
+                      ])
+                      
+                      # Create a ZIP file in memory
+                      zip_buffer = create_zip_in_memory(temp_dir)
+                      
+                      # Create the Lambda layer
+                      lambda_client = boto3.client('lambda')
+                      layer_response = lambda_client.publish_layer_version(
+                          LayerName=LAYER_NAME,
+                          Description='Lambda layer for PyPDF2',
+                          Content={
+                              'ZipFile': zip_buffer.getvalue()
+                          },
+                          CompatibleRuntimes=['python3.7', 'python3.8', 'python3.9', 'python3.12']
+                      )
+                      
+                      # Store the layer ARN and version in the response data
+                      response_data['LayerVersionArn'] = layer_response['LayerVersionArn']
+                      
+                      # Clean up
+                      shutil.rmtree(temp_dir)
+                      
+                  elif request_type == 'Delete':
+                      # Get the layer ARN and version from the event
+                      region = os.environ['AWS_REGION']
+                      account_id = context.invoked_function_arn.split(":")[4]
+                      layer_arn = f'arn:aws:lambda:{region}:{account_id}:layer:{LAYER_NAME}'
+                      
+                      lambda_client = boto3.client('lambda')
+                      layer_versions = lambda_client.list_layer_versions(LayerName=LAYER_NAME)
+                      
+                      for version in layer_versions['LayerVersions']:
+                          lambda_client.delete_layer_version(
+                              LayerName=layer_arn,
+                              VersionNumber=version['Version']
+                          )
+                          print(f"Deleted Lambda layer: {layer_arn}, version: {version['Version']}")
+                  
+                  # Send a success response
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, response_data)
+                  
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  # Send a failure response
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {})
+              return
+
+          def create_zip_in_memory(directory):
+              zip_buffer = io.BytesIO()
+              with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zipf:
+                  for root, _, files in os.walk(directory):
+                      for file in files:
+                          file_path = os.path.join(root, file)
+                          arcname = os.path.relpath(file_path, directory)
+                          zipf.write(file_path, arcname)
+              zip_buffer.seek(0)
+              return zip_buffer
+      Runtime: python3.12
+      Timeout: 300
+
+  PyPDF2LayerFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: PyPDF2LayerPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - lambda:PublishLayerVersion
+                  - lambda:DeleteLayerVersion
+                  - lambda:ListLayerVersions
+                Resource: 
+                  - !Sub 'arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:layer:PyPDF2Layer'
+                  - !Sub 'arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:layer:PyPDF2Layer:*'
+  ReportingSNSTopicEncryptionKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: KMS Key used to encrypt SNS Topic used to send out notifications.
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: 'kms:*'
+            Resource: '*'
+
+  ReportingSNSTopicEncryptionKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub 'alias/reporting/sns'
+      TargetKeyId: !Ref ReportingSNSTopicEncryptionKey
+
+  ReportingSNSTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      KmsMasterKeyId: !Ref ReportingSNSTopicEncryptionKey
+
+  SNSTopicSubscriptions:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref ReportingSNSTopic
+      Protocol: email
+      Endpoint: !Ref ReportingEmail
+  
+  MacieReportingFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Description: MacieReportingFunction handler_v1.0.1
+      Handler: index.macie_findings_handler
+      Role: !GetAtt MacieReportingFunctionRole.Arn
+      Code:
+        ZipFile: |
+          """
+          Lambda handler for reporting CloudTrail S3 events and Amazon Macie findings and taking remediation actions
+          """
+
+          import os
+          import json
+          import boto3
+          import logging
+
+          logger = logging.getLogger()
+          logger.setLevel("INFO")
+
+          sns = boto3.client("sns")
+
+          email_subject_prefix = os.getenv("NOTIFICATION_EMAIL_SUBJECT")
+          topic_arn = os.getenv("NOTIFICATION_TOPIC_ARN")
+          dataset_bucket = os.getenv("BUCKET_NAME")
+
+          def handle_macie_finding(event):
+              finding = event["detail"]
+
+              # Ignore archived events
+              if not finding.get("archived"):
+                  message = f"Amazon Macie published a new Finding: \"{finding.get('title')}\" \n"
+                  message += f"Description: \"{finding.get('description')}\" \n"
+                  message += f"Severity: {finding.get('severity')} \n"
+                  message += f"Type: {finding.get('type')} \n"
+                  message += f"Category: {finding.get('category')} \n"
+                  classification_details = finding.get("classificationDetails")
+                  if classification_details:
+                      origin_type = classification_details.get("originType")
+                      result = classification_details.get("result")
+                      sensitive_data_categories = [
+                          s.get("category") for s in result.get("sensitiveData")
+                      ]
+                      message += f'Origin Type: "{origin_type}" \n'
+                      message += f'Sensitive Data Categories: "{sensitive_data_categories}" \n'
+
+                  resources_affected = finding.get("resourcesAffected")
+                  s3_bucket = resources_affected.get("s3Bucket").get("name")
+                  s3_object = resources_affected.get("s3Object")
+                  message += f"\nResources affected: \nBucket=\"{s3_bucket}\", \nKey=\"{s3_object['key'] if s3_object else ''}\" \n\n"
+
+                  # If the finiding is for sensitive information (category: CLASSIFICATION) and High severity
+                  if (
+                      finding.get("category") == "CLASSIFICATION"
+                  ) and finding.get('severity').get('description') == 'High':
+                      try:
+                          message += f"Trying to delete S3 Object:  s3://{s3_bucket}/{s3_object['key']} \n"
+
+                          if s3_bucket == dataset_bucket:
+                              s3 = boto3.client("s3")
+                              del_response = s3.delete_object(Bucket=s3_bucket, Key=s3_object['key'])
+                              logger.info(del_response)
+                      except Exception as e:
+                          message += f"Couldn't delete S3 Object:  s3://{s3_bucket}/{s3_object['key']} \n"
+                          logger.error(e)
+              message += "\n-------------\n"
+              message += (
+                  f"Full Macie finding event: \n {json.dumps(event, indent=4, default=str)}"
+              )
+              return message
+              
+          def handle_cloudtrail_s3_notification(event):
+              message = "CloudTrail event notification for event summary:\n\n"
+              event_json = json.dumps(event, indent=4, default=str)
+              detail = event.get('detail')
+              if detail:
+                  message += f"Event Time: {detail.get('eventTime')} \n"
+                  message += f"Event Name: {detail.get('eventName')} \n"
+                  user_identity = detail.get('userIdentity')
+                  if user_identity:
+                      if 'sessionContext' in user_identity:
+                          del user_identity['sessionContext']
+                  message += f"User Identity: {detail.get('userIdentity')} \n"
+                  message += f"Request Parameters: {detail.get('requestParameters')} \n"
+                  message += f"Resources: {detail.get('resources')} \n"
+                  message += f"Source IP Address: {detail.get('sourceIPAddress')} \n"
+                  message += f"Event ID: {detail.get('eventID')} \n"
+              message += f"\n\nFull event: \n{event_json}"
+              return message
+
+          def lambda_handler(event, context):
+              logger.info("Input: {}".format(event))
+              
+              subject = f"{email_subject_prefix} - "
+              
+              if event.get('source', '') == 'aws.macie':
+                  subject += "Macie findings notification"
+                  message = handle_macie_finding(event)
+              elif event.get('source', '') == 'aws.s3':
+                  subject += "CloudTrail S3 event notification"
+                  message = handle_cloudtrail_s3_notification(event)
+              
+              logger.info(message)
+              
+              try:
+                  sns.publish(
+                      TopicArn=topic_arn,
+                      Subject=subject,
+                      Message=message,
+                  )
+              except Exception as e:
+                  logger.error(f"Error when publishing message to Topic '{topic_arn}'.")
+                  logger.error(e)
+
+              return
+          
+      Environment:
+        Variables:
+          SOURCE_BUCKET: !Ref AmazonQDatasetBucket
+          BUCKET_REGION: !Ref AWS::Region
+          MACIE_FINDINGS_TOPIC_ARN: !Ref ReportingSNSTopic
+      Timeout: 30
+      MemorySize: 512
+      TracingConfig:
+        Mode: Active
+      Runtime: python3.12
+
+  MacieReportingFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: MacieReportingFunctionPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: AllowS3
+                Effect: Allow
+                Resource: !Sub 'arn:aws:s3:::${AmazonQDatasetBucket}/*'
+                Action: s3:DeleteObject
+              - Sid: AllowSNS
+                Effect: Allow
+                Resource: !Ref ReportingSNSTopic
+                Action: sns:Publish
+              - Sid: AllowKMSKeyAccess
+                Effect: Allow
+                Resource: !GetAtt ReportingSNSTopicEncryptionKey.Arn
+                Action:
+                  - kms:Decrypt
+                  - kms:GenerateDataKey
+
+  MacieFindingsEventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      EventPattern:
+        detail-type:
+          - Macie Finding
+        source:
+          - aws.macie
+      Targets:
+        - Arn: !GetAtt MacieReportingFunction.Arn
+          Id: MacieReportingFunction
+
+  MacieEnableAndJobCustomResource:
+    Type: Custom::MacieEnableAndJob
+    Properties:
+      ServiceToken: !GetAtt MacieEnableAndJobFunction.Arn
+      SourceBucketName: !Ref AmazonQDatasetBucket
+      AccountId: !Ref AWS::AccountId
+
+  MacieEnableAndJobFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.handler
+      Role: !GetAtt MacieEnableAndJobFunctionRole.Arn
+      Code:
+        ZipFile: |
+          import boto3
+          import cfnresponse
+          import uuid
+          import time
+
+          def handler(event, context):
+              macie = boto3.client('macie2')
+              
+              try:
+                  if event['RequestType'] in ['Create', 'Update']:
+                      # Enable Macie
+                      try:
+                          macie.enable_macie()
+                      except macie.exceptions.ConflictException:
+                          print("Macie is already enabled")
+
+                      # Wait for Macie to be enabled
+                      for _ in range(10):  # Try up to 10 times
+                          try:
+                              macie.get_macie_session()
+                              break
+                          except macie.exceptions.ConflictException:
+                              time.sleep(10)  # Wait for 10 seconds before trying again
+                      else:
+                          raise Exception("Timed out waiting for Macie to be enabled")
+
+                      # Create classification job
+                      job_name = f"MacieClassificationJob_{uuid.uuid4()}"
+                      response = macie.create_classification_job(
+                          name=job_name,
+                          description='Detect sensitive data in S3',
+                          jobType='SCHEDULED',
+                          scheduleFrequency={'dailySchedule': {}},
+                          initialRun=True,
+                          managedDataIdentifierSelector='RECOMMENDED',
+                          samplingPercentage=100,
+                          s3JobDefinition={
+                              'bucketDefinitions': [
+                                  {
+                                      'accountId': event['ResourceProperties']['AccountId'],
+                                      'buckets': [event['ResourceProperties']['SourceBucketName']]
+                                  }
+                              ],
+                              'scoping': {
+                                  'excludes': {'and': []},
+                                  'includes': {
+                                      'and': [
+                                          {
+                                              'simpleScopeTerm': {
+                                                  'comparator': 'EQ',
+                                                  'key': 'OBJECT_EXTENSION',
+                                                  'values': ['txt']
+                                              }
+                                          }
+                                      ]
+                                  }
+                              }
+                          }
+                      )
+                      job_id = response['jobId']
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {'JobId': job_id})
+                  
+                  elif event['RequestType'] == 'Delete':
+                    # List and cancel Macie classification jobs
+                    try:
+                        jobs_to_cancel = []
+                        paginator = macie.get_paginator('list_classification_jobs')
+                        for page in paginator.paginate():
+                            for job in page['items']:
+                                if job['name'].startswith('MacieClassificationJob_'):
+                                    jobs_to_cancel.append(job['jobId'])
+
+                        for job_id in jobs_to_cancel:
+                            try:
+                                macie.update_classification_job(
+                                    jobId=job_id,
+                                    jobStatus='CANCELLED'  # Cancel the job
+                                )
+                                print(f"Successfully cancelled Macie classification job: {job_id}")
+                            except Exception as e:
+                                print(f"Error cancelling Macie classification job {job_id}: {str(e)}")
+
+                        print(f"Cancelled {len(jobs_to_cancel)} Macie classification jobs")
+                    except Exception as e:
+                        print(f"Error listing or cancelling Macie classification jobs: {str(e)}")
+                        # We don't want to fail the stack deletion if job cancellation fails
+
+                    cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+              
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {})
+      Runtime: python3.12
+      Timeout: 300  # Increased timeout to allow for Macie enablement
+
+  MacieEnableAndJobFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: MacieEnableAndJobFunctionPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: 
+                  - macie2:EnableMacie
+                  - macie2:GetMacieSession
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - macie2:CreateClassificationJob
+                  - macie2:UpdateClassificationJob
+                  - macie2:ListClassificationJobs
+                Resource: !Sub 'arn:aws:macie2:${AWS::Region}:${AWS::AccountId}:classification-job/*'
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+
+Outputs:
+  AmazonQDatasetBucketName:
+    Description: Name of the S3 bucket created for Amazon Q datasets
+    Value: !Ref AmazonQDatasetBucket
+    Export:
+      Name: !Sub "${AWS::StackName}-AmazonQDatasetBucketName"
